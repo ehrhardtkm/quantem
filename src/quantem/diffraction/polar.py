@@ -216,6 +216,20 @@ class PairDistributionFunction(AutoSerialize):
         -------
         PairDistributionFunction
         """
+        # Accept a raw 2D array/tensor directly (ports the old polar_torch
+        # from_data(array) convenience). Both wrap straight into a 1x1-scan
+        # Dataset4dstem (no Dataset2d hop — that branch just re-wraps into a
+        # Dataset4dstem anyway). A torch.Tensor uses from_tensor, which keeps
+        # GPU-resident data on-device and skips the VRAM<->RAM copy.
+        if isinstance(data, torch.Tensor):
+            if data.ndim != 2:
+                raise ValueError(f"raw tensor input must be 2D, got {tuple(data.shape)}")
+            data = Dataset4dstem.from_tensor(data[None, None], name="rdf_from_tensor")
+        elif isinstance(data, np.ndarray):
+            if data.ndim != 2:
+                raise ValueError(f"raw array input must be 2D, got {data.shape}")
+            data = Dataset4dstem.from_array(array=data[None, None], name="rdf_from_array")
+
         if device is None:
             device = data.device if data.array is None else "cpu"
 
