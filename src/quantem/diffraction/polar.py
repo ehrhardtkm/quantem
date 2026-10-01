@@ -1198,7 +1198,6 @@ class PairDistributionFunction(AutoSerialize):
         y = to_numpy(Gr)
         x, y = self._apply_xrange(x, y, rmin, rmax)
 
-        # Find radial value of primary peak and trough for y-limits
         # Filter out NaN and Inf values to avoid plot errors
         valid_mask = np.isfinite(y)
         if np.any(valid_mask):
@@ -1247,7 +1246,6 @@ class PairDistributionFunction(AutoSerialize):
         y = to_numpy(self._pdf)
         x, y = self._apply_xrange(x, y, rmin, rmax)
 
-        # Find radial value of primary peak
         # Filter out NaN and Inf values to avoid plot errors
         valid_mask = np.isfinite(y)
         if np.any(valid_mask):
