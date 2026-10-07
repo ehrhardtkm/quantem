@@ -463,7 +463,6 @@ class TestIntegrationWorkflows:
         Gr_results = pdf.calculate_Gr(
             k_min_fit=0.1,
             k_max_fit=2.0,
-            r_min=0.0,
             r_max=10.0,
             r_step=0.05,
             returnval=True,
@@ -621,6 +620,20 @@ class TestStateHandling:
         )
         np.testing.assert_allclose(pdf.pdf, fresh.pdf)
 
+    def test_max_iter_reaches_the_low_r_correction(self, synthetic_dataset2d):
+        pdf = PairDistributionFunction.from_data(synthetic_dataset2d, find_origin=False)
+        kw = dict(k_min_fit=0.1, k_max_fit=2.0, damp_origin_oscillations=True, density=0.05)
+        # no iterations: the corrected G(r) is the uncorrected one
+        pdf.calculate_Gr(**kw, max_iter=0)
+        G0 = pdf.reduced_pdf
+        np.testing.assert_allclose(
+            pdf.reduced_pdf_damped.cpu().numpy(), G0, rtol=0, atol=1e-4 * np.abs(G0).max()
+        )
+        pdf.calculate_Gr(**kw, max_iter=1)
+        G1 = pdf.reduced_pdf_damped.cpu().numpy()
+        pdf.calculate_Gr(**kw, max_iter=6)
+        assert not np.allclose(G1, pdf.reduced_pdf_damped.cpu().numpy())
+
 
 # ============================================================================
 # Known-answer tests: analytic hard-sphere S(k) with known density
@@ -678,12 +691,9 @@ class TestKnownAnswer:
         pdf.calculate_Gr(k_min_fit=0.01, k_max_fit=float(k[-1]), r_max=10.0, r_step=0.02)
         r = pdf.r
         wk = pdf._k_window(
-            torch.tensor(k, dtype=torch.float32), pdf.kmin_window, pdf.kmax_window, pdf.k_width
+            torch.tensor(k, dtype=torch.float32), pdf.kmin_window, pdf.kmax_window
         ).numpy()
         Fk = k * (S - 1)
-        Fk = Fk - np.sum(Fk * wk) / np.sum(
-            wk
-        )  # window-weighted mean subtraction, as in the pipeline
         F = 2 * np.pi * Fk * wk
         dk = k[1] - k[0]
         G_ref = (2 / np.pi) * dk * 2 * np.pi * (np.sin(2 * np.pi * np.outer(r, k)) @ F)
@@ -693,8 +703,8 @@ class TestKnownAnswer:
         assert abs(r[np.argmax(pdf.reduced_pdf)] - 2.58) < 0.35
 
     def test_low_r_correction_with_known_density(self):
-        """With the true density, the corrected G(r) is -4 pi rho0 r below the first peak,
-        g(r) is ~0 there, and the first peak is not moved."""
+        """With the true density and r_cut below the contact distance, the corrected G(r)
+        is -4 pi rho0 r there, g(r) is ~0, and the first peak is not moved."""
         pdf, k, S = self._pdf_with_injected_S()
         pdf.calculate_Gr(k_min_fit=0.01, k_max_fit=float(k[-1]), r_max=10.0, r_step=0.02)
         r = pdf.r
@@ -706,6 +716,7 @@ class TestKnownAnswer:
             r_step=0.02,
             damp_origin_oscillations=True,
             density=self.RHO0,
+            r_cut=2.0,  # below the hard-sphere contact at 2.58 A
         )
         G_cor = pdf.reduced_pdf_damped.cpu().numpy()
         m = (r > 0.3) & (r < 1.5)
