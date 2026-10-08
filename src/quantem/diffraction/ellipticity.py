@@ -79,7 +79,7 @@ def fit_elliptical_distortion(
         indexing="ij",
     )
     r = torch.sqrt(d_col**2 + d_row**2)
-    in_fit = (r > r_in) & (r < r_out)
+    in_fit = (r > r_in) & (r < r_out) & dp.isfinite()
     if mask is not None:
         in_fit &= ~torch.as_tensor(mask, dtype=torch.bool, device=device)
     d_row, d_col, r, values = d_row[in_fit], d_col[in_fit], r[in_fit], dp[in_fit]
