@@ -254,14 +254,19 @@ def find_origin_angular_grid(
             base_row_norm + (cand_rows.reshape(-1).float() * row_norm_scale - 1.0)[:, None, None]
         )
         grids = torch.stack([g_col, g_row], dim=-1)
-        dps = dp_batch.repeat_interleave(n_cands, dim=0)
+        # Stack each DP's candidate grids along the grid's row dim, so each DP
+        # is sampled from its own image instead of from n_cands copies of it
         polars = F.grid_sample(
-            dps, grids, mode="bilinear", padding_mode="zeros", align_corners=True
+            dp_batch,
+            grids.view(dp_batch.shape[0], n_cands * search_n_phi, n_r, 2),
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
         )
         region = polars.view(dp_batch.shape[0], n_cands, *base_col_norm.shape)[
             ..., min_r_idx:max_r_idx
         ]
-        std_r = region.std(dim=2)
+        std_r = _angular_std(region, dim=2)
         mean_r = region.mean(dim=2)
         if ring_weights is not None:
             std_r = std_r * ring_weights
@@ -295,7 +300,7 @@ def find_origin_angular_grid(
             align_corners=True,
         )
         region_coarse = polars_coarse[:, :, :, min_r_idx:max_r_idx]
-        std_r_coarse = region_coarse.std(dim=2)
+        std_r_coarse = _angular_std(region_coarse, dim=2)
         mean_r_coarse = region_coarse.mean(dim=2)
         if ring_weights is not None:
             std_r_coarse = std_r_coarse * ring_weights
@@ -764,12 +769,21 @@ def _angular_std_scores(
     # do not win on absolute std alone (relevant when search windows are
     # wide enough to include centers far from the direct beam).
     region = polars.squeeze(1)[:, :, min_r_idx:max_r_idx]
-    std_r = region.std(dim=1)
+    std_r = _angular_std(region, dim=1)
     mean_r = region.mean(dim=1)
     if ring_weights is not None:
         std_r = std_r * ring_weights
         mean_r = mean_r * ring_weights
     return std_r.sum(dim=1) / (mean_r.sum(dim=1) + 1e-6)
+
+
+def _angular_std(region: torch.Tensor, dim: int) -> torch.Tensor:
+    """``region.std(dim=dim)``, with a faster route on CPU."""
+    if region.device.type != "cpu":
+        return region.std(dim=dim)
+    region = region.double()
+    centred = region - region.mean(dim=dim, keepdim=True)
+    return (centred.square().sum(dim=dim) / (region.shape[dim] - 1)).sqrt().float()
 
 
 def _quadratic_subpixel_offset(patch: torch.Tensor) -> torch.Tensor:
