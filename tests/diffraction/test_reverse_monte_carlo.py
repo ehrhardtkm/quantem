@@ -318,6 +318,41 @@ def test_fit_geometry_on_synthetic_lattice(tmp_path):
         assert np.isfinite(out._update_residual())
 
 
+def test_fit_geometry_calibrates_sampling_to_the_crystal(tmp_path):
+    path = tmp_path / "vnb.cif"
+    path.write_text(CIF)
+    zones = [(0, 0, 1), (0, 1, 1)]
+    centers = [np.array([78.3, 81.6]), np.array([80.5, 79.2])]
+    true_sampling = 0.03
+    fits = {}
+    for calibrate in (False, True):
+        out = ReverseMonteCarlo.from_images(
+            [np.zeros((160, 160))] * 2, zone_axes=zones, sampling=true_sampling, bin_factor=4
+        )
+        out.set_crystal(Crystal.from_cif(path, verbose=False))
+        out.images = [
+            _synthetic_pattern(out, z, c, th).astype(np.float32)
+            for z, c, th in zip(zones, centers, (0.3, -0.7))
+        ]
+        # pixel size in the file too small, so the fitted lattice parameter comes out 8.5% too
+        # large, as in the NbVZr patterns (3.656 against 3.37 A)
+        out.sampling = true_sampling / 1.085
+        out.fit_geometry(scale_range=(1.05, 1.12), calibrate_sampling=calibrate, verbose=False)
+        fits[calibrate] = out
+    raw, cal = fits[False], fits[True]
+    assert raw.lattice_parameter == pytest.approx(3.2 * 1.085, rel=1e-2)
+    assert cal.lattice_parameter == pytest.approx(3.2, rel=1e-12)
+    assert np.mean(cal.geometry["a"]) == pytest.approx(3.2, rel=1e-12)
+    assert cal.sampling == pytest.approx(true_sampling, rel=1e-2)
+    for A_raw, A_cal in zip(raw.geometry["matrices"], cal.geometry["matrices"]):
+        np.testing.assert_allclose(A_cal, A_raw)
+    # the fitted reflections now sit at the crystal's scattering vectors
+    for i in range(len(zones)):
+        px = cal.geometry["bragg_px"][i]
+        q = cal._q_zone(i, px[:, 0], px[:, 1])
+        np.testing.assert_allclose(q, cal.geometry["bragg_g"][i], atol=1e-9)
+
+
 def test_shell_correlations_match_warren_cowley(rmc):
     sc = rmc.shell_correlations(n_shells=4)
     sro = rmc.warren_cowley(n_shells=4)
@@ -371,3 +406,223 @@ def test_to_atoms_and_cif_round_trip(rmc, tmp_path):
     assert len(back) == n
     assert np.allclose(back.cell.lengths(), atoms.cell.lengths())
     assert np.allclose(back.get_scaled_positions(), atoms.get_scaled_positions(), atol=1e-5)
+
+
+def _toy_local_calculator(rc):
+    """Species-dependent pair energy, cut off sharply at ``rc``, reporting per-atom energies."""
+    from ase.calculators.calculator import Calculator, all_changes
+    from ase.neighborlist import neighbor_list
+
+    class ToyLocal(Calculator):
+        implemented_properties = ["energy", "energies"]
+
+        def calculate(self, atoms=None, properties=None, system_changes=all_changes):
+            super().calculate(atoms, properties, system_changes)
+            i, j, d = neighbor_list("ijd", self.atoms, rc)
+            z = self.atoms.numbers
+            pair = (0.05 + 0.002 * (z[i] % 7) * (z[j] % 7)) * ((2.5 / d) ** 8 - (2.5 / d) ** 4)
+            e = 0.5 * np.bincount(i, pair, minlength=len(self.atoms))
+            self.results = {"energies": e, "energy": float(e.sum())}
+
+    return ToyLocal()
+
+
+def test_set_energy_builds_the_supercell_in_angstrom(rmc):
+    rmc.set_energy(_toy_local_calculator(3.0), r_cut=3.0, temperature=1273.15)
+    ce = rmc.energy_model
+    edge = rmc._a_crystal * rmc.cells
+    np.testing.assert_allclose(ce.cell, edge)
+    expected = rmc._positions(np.arange(len(rmc.site_x))) / rmc.grid_size * edge
+    np.testing.assert_allclose(ce.positions, expected)
+    assert ce.numbers.tolist() == [rmc.numbers[k] for k in rmc.species_index]
+    d = ce.positions[1:] - ce.positions[0]
+    d -= edge * np.round(d / edge)
+    nearest = np.linalg.norm(d, axis=1).min()
+    assert nearest == pytest.approx(rmc._a_crystal * np.sqrt(3) / 2)
+    assert rmc.energy_kT == pytest.approx(8.617333262e-5 * 1273.15)
+    assert rmc.displacement_kT == pytest.approx(rmc.energy_kT)
+    # a swap of two unlike sites, against a full recompute
+    j = int(np.nonzero(ce.numbers != ce.numbers[0])[0][0])
+    num = ce.numbers.copy()
+    num[[0, j]] = num[[j, 0]]
+    dE, _, _ = ce.delta([0, j], numbers=num[[0, j]])
+    assert dE == pytest.approx(ce.full_energies(numbers=num).sum() - ce.total, abs=1e-9)
+
+
+def test_set_energy_needs_unmerged_species_and_resets_with_the_supercell(tmp_path, rmc):
+    path = tmp_path / "vnb_merged.cif"
+    path.write_text(CIF)
+    merged = ReverseMonteCarlo.from_images(
+        rmc.images, zone_axes=rmc.zone_axes, sampling=rmc.sampling, bin_factor=rmc.bin_factor
+    )
+    merged.set_crystal(Crystal.from_cif(path, verbose=False), merge={"Zr": "Nb"})
+    merged.geometry = rmc.geometry
+    merged.set_mask(bragg_radius=0.06, q_max=0.6, center_radius=0.1, edge_px=2)
+    merged.build_supercell(cells=4, seed=0, device="cpu")
+    with pytest.raises(ValueError, match="without merge"):
+        merged.set_energy(_toy_local_calculator(3.0), r_cut=3.0, temperature=1273.15)
+
+    rmc.set_energy(_toy_local_calculator(3.0), r_cut=3.0, temperature=1273.15)
+    rmc.build_supercell(cells=4, seed=1, device="cpu")
+    assert rmc.energy_model is None
+
+
+def test_save_after_set_energy_skips_the_energy_model(rmc, tmp_path):
+    from quantem.core.io import load
+
+    rmc.set_energy(_toy_local_calculator(3.0), r_cut=3.0, temperature=1273.15)
+    path = tmp_path / "rmc.zip"
+    rmc.save(path, mode="o", skip=rmc.DERIVED_ATTRIBUTES)
+    back = load(path)
+    assert getattr(back, "energy_model", None) is None
+    assert back.energy_temperature == pytest.approx(1273.15)
+
+
+def test_set_data_sigma_puts_the_fit_at_one_sigma_per_pixel(rmc):
+    rmc.set_data_sigma()
+    loss = rmc._update_residual()
+    assert loss / rmc.data_sigma2 == pytest.approx(float(rmc._w.sum()))
+    assert rmc.data_ceiling == pytest.approx(loss)
+    assert rmc.data_weight == 1.0
+    rmc.set_data_sigma(sigma=0.5)
+    assert rmc.data_sigma2 == pytest.approx(0.25)
+
+
+def test_hybrid_run_needs_data_sigma(rmc):
+    rmc.set_energy(_toy_local_calculator(3.0), r_cut=3.0, temperature=1273.15)
+    with pytest.raises(RuntimeError, match="set_data_sigma"):
+        rmc.run(n_sweeps=1, progress=False)
+
+
+def test_hybrid_run_keeps_the_energy_exact(rmc):
+    rmc.set_energy(_toy_local_calculator(3.0), r_cut=3.0, temperature=1273.15)
+    rmc.set_data_sigma()
+    ce = rmc.energy_model
+    drifts = []
+    rebuild = ce.rebuild
+    ce.rebuild = lambda: drifts.append(rebuild()) or drifts[-1]
+    counts = np.bincount(rmc.species_index)
+    start = rmc.species_index.copy()
+    rmc.run(n_sweeps=4, batch=16, max_static_b=None, refit_every=2, progress=False)
+    # the incrementally updated energies agree with every full recompute
+    assert len(drifts) == 3 and max(abs(d) for d in drifts) < 1e-9
+    assert np.array_equal(np.bincount(rmc.species_index), counts)
+    assert ce.numbers.tolist() == np.asarray(rmc.numbers)[rmc.species_index].tolist()
+    edge = rmc._a_crystal * rmc.cells
+    expected = rmc._positions(np.arange(len(rmc.site_x))) / rmc.grid_size * edge
+    np.testing.assert_allclose(ce.positions, expected)
+    assert len(rmc.energy_history) == 5
+    assert not np.array_equal(rmc.species_index, start) or np.any(rmc.displacement)
+
+
+def test_hybrid_moves_in_a_batch_are_kept_apart(rmc):
+    rmc.set_energy(_toy_local_calculator(3.0), r_cut=3.0, temperature=1e5)
+    # every data change is small: all proposals reach the energy test
+    rmc.set_data_sigma(sigma=1e3)
+    ce = rmc.energy_model
+    spec = rmc.species_index
+    i = np.arange(len(spec))
+    sites = np.array([(a, b) for a in i for b in i[a + 1 :] if spec[a] != spec[b]])
+    sites = sites[rmc.rng.permutation(len(sites))[:64]]
+    moves, n_energy = rmc._hybrid_pick("swap", sites, None, np.zeros(len(sites)), 32, None, np.inf)
+    assert 0 < len(moves) <= n_energy <= 32
+    atoms = [ce.positions[m[1]] for m in moves]
+    for k in range(len(atoms)):
+        for m in range(k):
+            d = atoms[k][:, None] - atoms[m][None]
+            d -= ce.cell * np.round(d / ce.cell)
+            assert np.linalg.norm(d, axis=-1).min() >= ce.radius
+
+
+def test_hybrid_swaps_and_displacements_use_their_own_temperatures(rmc):
+    rmc.set_energy(
+        _toy_local_calculator(3.0), r_cut=3.0, temperature=1e9, displacement_temperature=1e-6
+    )
+    rmc.set_data_sigma()
+    ce = rmc.energy_model
+    # data-neutral proposals: swaps at a huge temperature all pass the energy test
+    spec = rmc.species_index
+    i = np.arange(len(spec))
+    sites = np.array([(a, b) for a in i for b in i[a + 1 :] if spec[a] != spec[b]])
+    sites = sites[rmc.rng.permutation(len(sites))[:64]]
+    moves, n_energy = rmc._hybrid_pick("swap", sites, None, np.zeros(len(sites)), 32, None, np.inf)
+    assert len(moves) == n_energy > 0
+    # displacements at a tiny temperature pass only if they lower the energy
+    sites, new = rmc._random_proposals(64)
+    moves, n_energy = rmc._hybrid_pick(
+        "random", sites, new, np.zeros(len(sites)), 64, None, np.inf
+    )
+    assert len(moves) < n_energy
+    for _, idx, _, positions, _, _ in moves:
+        assert ce.delta(idx, positions=positions)[0] <= 1e-9
+
+
+def test_hybrid_data_weight_scales_the_data_test(rmc):
+    rmc.set_energy(_toy_local_calculator(3.0), r_cut=3.0, temperature=1e9)
+    rmc.set_data_sigma(sigma=1.0)
+    spec = rmc.species_index
+    i = np.arange(len(spec))
+    sites = np.array([(a, b) for a in i for b in i[a + 1 :] if spec[a] != spec[b]])[:64]
+    dl = np.full(len(sites), 0.2)  # dchi2/2 = 0.1: a small change at weight 1
+    moves, _ = rmc._hybrid_pick("swap", sites, None, dl, 32, None, np.inf)
+    assert len(moves) > 0
+    rmc.data_weight = 1e3  # weighted change 100: every move fails the data test
+    moves, n_energy = rmc._hybrid_pick("swap", sites, None, dl, 32, None, np.inf)
+    assert moves == [] and n_energy == 0
+
+
+def test_hybrid_data_weight_rises_above_the_ceiling_and_returns_to_one(rmc):
+    rmc.set_energy(_toy_local_calculator(3.0), r_cut=3.0, temperature=1273.15)
+    rmc.set_data_sigma()
+    n_batches = -(-len(rmc.site_x) // 16)
+    rmc.data_ceiling = 0.0  # every loss is above it
+    rmc.run(n_sweeps=1, batch=16, max_static_b=None, progress=False)
+    assert rmc.data_weight == pytest.approx(rmc._WEIGHT_RATE**n_batches)
+    rmc.data_ceiling = np.inf  # every loss is below it
+    rmc.run(n_sweeps=2, batch=16, max_static_b=None, progress=False)
+    assert rmc.data_weight == 1.0
+
+
+def _toy_force_calculator(rc):
+    """Smooth species-dependent Morse pair energy, zero at ``rc``, with forces."""
+    from ase.calculators.calculator import Calculator, all_changes
+    from ase.neighborlist import neighbor_list
+
+    class ToyForces(Calculator):
+        implemented_properties = ["energy", "energies", "forces"]
+
+        def calculate(self, atoms=None, properties=None, system_changes=all_changes):
+            super().calculate(atoms, properties, system_changes)
+            i, j, d, D = neighbor_list("ijdD", self.atoms, rc)
+            z = self.atoms.numbers
+            eps = 0.05 + 0.002 * (z[i] % 7) * (z[j] % 7)
+            x = d - 2.6
+            cut, dcut = (1 - (d / rc) ** 2) ** 2, -4 * d / rc**2 * (1 - (d / rc) ** 2)
+            m, dm = np.exp(-4 * x) - 2 * np.exp(-2 * x), -4 * np.exp(-4 * x) + 4 * np.exp(-2 * x)
+            phi, dphi = eps * m * cut, eps * (dm * cut + m * dcut)
+            e = 0.5 * np.bincount(i, phi, minlength=len(self.atoms))
+            f = np.zeros((len(self.atoms), 3))
+            np.add.at(f, i, (dphi / d)[:, None] * D)  # D = r_j - r_i
+            self.results = {"energies": e, "energy": float(e.sum()), "forces": f}
+
+    return ToyForces()
+
+
+def test_hybrid_run_with_relaxed_swaps_keeps_the_fit_positions(rmc):
+    from quantem.diffraction.rmc_energy import RelaxedSwapEnergy
+
+    rmc.set_energy(
+        _toy_force_calculator(3.0), r_cut=3.0, temperature=1e4, relax_radius=1.0, relax_fmax=1e-3
+    )
+    ce = rmc.energy_model
+    assert isinstance(ce, RelaxedSwapEnergy)
+    rmc.set_data_sigma()
+    displacement, start = rmc.displacement.copy(), rmc.species_index.copy()
+    rmc.run(n_sweeps=2, batch=16, random_fraction=0.0, max_static_b=None, progress=False)
+    assert not np.array_equal(rmc.species_index, start)
+    # the energy's relaxed positions stay its own; the fit keeps its displacements
+    np.testing.assert_array_equal(rmc.displacement, displacement)
+    assert ce.numbers.tolist() == np.asarray(rmc.numbers)[rmc.species_index].tolist()
+    assert len(rmc.energy_history) == 3
+    with pytest.raises(ValueError, match="swaps only"):
+        rmc.run(n_sweeps=1, batch=16, random_fraction=0.5, progress=False)

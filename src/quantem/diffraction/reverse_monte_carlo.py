@@ -210,6 +210,7 @@ class ReverseMonteCarlo(AutoSerialize):
         "_W_all", "_Wc", "_Wv", "_sym_index", "_needed", "_used", "_h_needed", "_cos", "_sin",
         "_Fr", "_Fi", "_fs", "_keep", "_u", "_u_all", "_y", "_w", "_y_all", "_w_all", "_img",
         "_fit", "_r", "_bg", "_scale", "_basis_all", "_pix_image", "_env_cols", "_site_lookup",
+        "energy_model",  # holds a calculator; not rebuilt on load, call set_energy again
     )  # fmt: skip
 
     def _post_load(self) -> None:
@@ -354,6 +355,7 @@ class ReverseMonteCarlo(AutoSerialize):
         k_max: float = 1.6,
         centers: Sequence | None = None,
         fit_tilt: bool = True,
+        calibrate_sampling: bool = False,
         verbose: bool = True,
     ) -> "ReverseMonteCarlo":
         """Index every pattern, fit its detector distortion and its tilt off the zone axis.
@@ -363,7 +365,9 @@ class ReverseMonteCarlo(AutoSerialize):
         than the direct beam), or nearest ``centers[i]`` (row, col). Each
         pattern then gets its own center and 2x2 detector matrix (rotation,
         scale, ellipticity), fitted to the matched peaks. The lattice
-        parameter is the mean over patterns at the nominal pixel size.
+        parameter is the mean over patterns at the nominal pixel size, or,
+        with ``calibrate_sampling``, the crystal's, with the pixel size
+        rescaled to match.
 
         The tilt (beam direction off the zone axis, small-angle vector in the
         zone frame) is fitted to the Bragg intensities: each reflection's
@@ -384,6 +388,13 @@ class ReverseMonteCarlo(AutoSerialize):
             entries (or ``centers=None``) use the halo center.
         fit_tilt : bool, optional
             Fit the tilt of each pattern. If False, the tilts are zero.
+        calibrate_sampling : bool, optional
+            Trust the crystal's lattice parameter (``set_crystal``) over the
+            detector's pixel size: rescale ``sampling`` so the mean fitted
+            lattice parameter equals the crystal's, before the tilts are
+            fitted. Scattering vectors, the Ewald sphere and lengths in A are
+            then physical. The fitted reflection positions do not change.
+            Default False.
         verbose : bool, optional
             Print the fitted geometry of each pattern.
 
@@ -398,7 +409,7 @@ class ReverseMonteCarlo(AutoSerialize):
             "excitation_width" (1/A). "excitation_width" is the width of the
             Gaussian excitation-error profile fitted with the tilt; it is a
             diagnostic only and is not used later. ``self.lattice_parameter``
-            is set to the mean of "a".
+            is set to the mean of "a" (rescaled with ``calibrate_sampling``).
         """
         if self.crystal is None:
             raise RuntimeError("set_crystal first")
@@ -481,6 +492,14 @@ class ReverseMonteCarlo(AutoSerialize):
                 )
 
         self.lattice_parameter = float(np.mean(geo["a"]))
+        if calibrate_sampling:
+            ratio = self.lattice_parameter / self._a_crystal
+            self.sampling *= ratio
+            pix = self.sampling
+            geo["a"] = [a_i / ratio for a_i in geo["a"]]
+            self.lattice_parameter = self._a_crystal
+            if verbose:
+                print(f"pixel size rescaled by {ratio:.4f} to the crystal's lattice parameter")
         self.geometry = geo
         for i in range(len(self.images)):
             tilt, width = (np.zeros(2), np.nan)
@@ -1005,6 +1024,7 @@ class ReverseMonteCarlo(AutoSerialize):
         self.shared_scale = bool(shared_scale)
         self.max_beams = int(max_beams)
         self.device = torch.device(device or _default_device())
+        self.energy_model = None  # set_energy builds it for this supercell
         self._setup_forward()
         print(
             f"{n_sites} sites ("
@@ -1017,6 +1037,138 @@ class ReverseMonteCarlo(AutoSerialize):
     def _positions(self, sites: np.ndarray, disp: np.ndarray | None = None) -> np.ndarray:
         disp = self.displacement[sites] if disp is None else disp
         return np.mod(self.site_x[sites] + disp, self.grid_size)
+
+    def set_energy(
+        self,
+        calculator,
+        r_cut: float,
+        temperature: float,
+        displacement_temperature: float | None = None,
+        margin: float = 0.5,
+        relax_radius: float | None = None,
+        relax_fmax: float = 0.05,
+    ) -> "ReverseMonteCarlo":
+        """Interatomic energy of the supercell from a strictly local potential.
+
+        Every site's energy is cached from one evaluation of the whole periodic supercell, and
+        the energy change of a move is computed exactly from a cluster around the moved atoms
+        (:class:`quantem.diffraction.rmc_energy.ClusterEnergy`). Positions are the sites plus
+        their displacements, in A at the crystal's lattice parameter (``set_crystal``). Every
+        species must be fitted separately (no ``merge`` in ``set_crystal``). Call after
+        ``build_supercell``, and again after rebuilding the supercell or loading a saved fit.
+
+        With ``relax_radius``, swaps are judged by relaxed energy changes instead
+        (:class:`quantem.diffraction.rmc_energy.RelaxedSwapEnergy`): the energy keeps its own
+        relaxed copy of the positions, starting from one relaxation of the whole supercell, and
+        relaxes the atoms within ``relax_radius`` of each swapped pair. Those positions are not
+        the fit's: the fit and the energy share the species on every site, not the
+        displacements. Only swaps can then be run.
+
+        Parameters
+        ----------
+        calculator : ase.calculators.calculator.Calculator
+            Reports per-atom ``energies`` (eV) and is strictly local within ``r_cut``, e.g.
+            from :func:`quantem.diffraction.rmc_energy.nequip_energy_calculator`.
+        r_cut : float
+            Cut-off (A) beyond which no per-atom energy depends on any position.
+        temperature : float
+            Temperature (K) at which energy changes of swaps are weighed, as ``dE / k_B T``.
+        displacement_temperature : float, optional
+            Temperature (K) for displacement moves. Default ``temperature``.
+        margin : float
+            Extra cluster radius (A) on top of ``2 r_cut``.
+        relax_radius : float, optional
+            Judge swaps by relaxed energy changes, relaxing the atoms within this distance (A) of
+            each swapped pair. The calculator must also report ``forces``, e.g. from
+            :func:`quantem.diffraction.rmc_energy.nequip_force_calculator`.
+        relax_fmax : float
+            With ``relax_radius``: a relaxation stops once the largest force is below this
+            (eV/A).
+
+        Returns
+        -------
+        ReverseMonteCarlo
+            self, with ``energy_model`` (the cache), ``energy_temperature`` and
+            ``displacement_temperature`` (K), and ``energy_kT`` and ``displacement_kT`` (eV).
+        """
+        from ase.data import chemical_symbols
+
+        from quantem.diffraction.rmc_energy import ClusterEnergy, RelaxedSwapEnergy
+
+        if getattr(self, "site_x", None) is None:
+            raise RuntimeError("build_supercell first")
+        if len(self.to_atoms()) != len(self.site_x):
+            raise NotImplementedError("The energy is implemented for mixed-site crystals only.")
+        elements = {chemical_symbols[int(z)] for z in self.crystal.numbers}
+        if elements != set(self.species):
+            raise ValueError(
+                f"The crystal has {sorted(elements)} but the fit has {sorted(self.species)}: "
+                "the energy needs every species, so call set_crystal without merge."
+            )
+        edge = self.cells * self._a_crystal
+        positions = self._positions(np.arange(len(self.site_x))) / self.grid_size * edge
+        numbers = np.asarray(self.numbers)[self.species_index]
+        if relax_radius is None:
+            self.energy_model = ClusterEnergy(calculator, r_cut, numbers, positions, edge, margin)
+        else:
+            self.energy_model = RelaxedSwapEnergy(
+                calculator,
+                r_cut,
+                numbers,
+                positions,
+                edge,
+                relax_radius,
+                relax_fmax,
+                margin=margin,
+            )
+        self.energy_temperature = float(temperature)
+        self.energy_kT = 8.617333262e-5 * self.energy_temperature  # eV
+        if displacement_temperature is None:
+            displacement_temperature = temperature
+        self.displacement_temperature = float(displacement_temperature)
+        self.displacement_kT = 8.617333262e-5 * self.displacement_temperature
+        print(
+            f"energy: {len(numbers)} atoms, {self.energy_model.total / len(numbers):.4f} eV/atom, "
+            f"r_cut {r_cut:.2f} A, kT {self.energy_kT:.4f} eV at {self.energy_temperature:.0f} K "
+            f"for swaps, {self.displacement_kT:.4f} eV at {self.displacement_temperature:.0f} K "
+            "for displacements"
+            + ("" if relax_radius is None else f"; swaps relaxed within {relax_radius:.1f} A")
+        )
+        return self
+
+    def set_data_sigma(self, sigma: float | None = None) -> "ReverseMonteCarlo":
+        """Uncertainty of the binned diffuse data, for weighing the fit against an energy.
+
+        With an energy (``set_energy``), ``run`` measures the fit as
+        ``chi2 = sum w (y - model)^2 / sigma^2``, in the units of the normalized patterns. By
+        default sigma is set so that the current fit sits at about one sigma per pixel,
+        ``sigma^2 = sum w (y - model)^2 / sum w``: call it at the best data-only fit, so that what
+        the model cannot fit is treated as noise. The current loss also becomes the ceiling under
+        which ``run`` keeps the fit, by weighing the data more whenever the loss is above it.
+
+        Parameters
+        ----------
+        sigma : float, optional
+            The uncertainty itself, in normalized intensity units, in place of the default.
+
+        Returns
+        -------
+        ReverseMonteCarlo
+            self, with ``data_sigma2`` (sigma squared), ``data_ceiling`` (the current weighted
+            loss) and ``data_weight`` (reset to 1).
+        """
+        loss = self._update_residual()
+        if sigma is None:
+            self.data_sigma2 = loss / float(self._w.sum())
+        else:
+            self.data_sigma2 = float(sigma) ** 2
+        self.data_ceiling = loss
+        self.data_weight = 1.0
+        print(
+            f"data sigma {np.sqrt(self.data_sigma2):.4g}: chi2 {loss / self.data_sigma2:.0f} "
+            f"over {int(self._fit.sum())} fitted pixels"
+        )
+        return self
 
     # metallic (12-fold coordination) radii, A
     _RADII = {
@@ -1630,6 +1782,10 @@ class ReverseMonteCarlo(AutoSerialize):
 
     # ---------------------------------------------------------------------- RMC
 
+    # factor by which a run with an energy changes the data weight after every batch: it doubles,
+    # or halves back toward 1, in 50 batches
+    _WEIGHT_RATE = 2 ** (1 / 50)
+
     def run(
         self,
         n_sweeps: int = 20,
@@ -1663,6 +1819,27 @@ class ReverseMonteCarlo(AutoSerialize):
         is one proposal per site. Scale and background are refit every
         ``refit_every`` sweeps.
 
+        With an energy (``set_energy`` and ``set_data_sigma``), the run accepts
+        moves by ``exp(-w chi2/2 - E/kT)`` instead, and ``temperature`` is not
+        used. kT is ``energy_kT`` for swaps and ``displacement_kT`` for
+        displacement moves. The data weight w keeps the fit under the ceiling
+        set by ``set_data_sigma``: before every batch it grows by
+        ``_WEIGHT_RATE`` while the loss is above the ceiling, and shrinks back
+        toward 1 while it is below, so the energy only gets moves the data
+        tolerate and any rise of the loss is temporary. Moves whose weighted
+        data change is large (``w |dchi2| / 2 > 3``) first pass a data test,
+        ``exp(-w dchi2/2)``; the others go straight on. The candidates are taken
+        in random order, skipping any closer than the energy model's separation
+        (``2 r_cut + margin``; twice the relaxation radius more with relaxed
+        swaps) to a move already accepted (so the energy changes add exactly),
+        up to the adaptive cap; each one's exact energy change then decides it,
+        ``exp(-dE/kT)`` after a data test, ``exp(-w dchi2/2 - dE/kT)``
+        otherwise. The batch is rejected and the cap halved if the moves' joint
+        weighted data change exceeds the sum of their separate changes by more
+        than one unit of ``w chi2/2`` per move. Every per-atom energy is
+        recomputed at each refit (with relaxed swaps, the whole supercell is
+        relaxed again), and with relaxed swaps only swaps may be proposed.
+
         Parameters
         ----------
         n_sweeps : int, optional
@@ -1671,7 +1848,8 @@ class ReverseMonteCarlo(AutoSerialize):
             Moves proposed per batch. Default 32.
         temperature : float, optional
             Initial Metropolis temperature as a fraction of the median
-            absolute score change of the first batch. Default 0.05.
+            absolute score change of the first batch. Default 0.05. Not used
+            with an energy.
         random_fraction : float, optional
             Probability that a batch proposes single-atom displacements.
             Ignored (0) if the supercell has no displacements. Default 0.5.
@@ -1690,7 +1868,9 @@ class ReverseMonteCarlo(AutoSerialize):
         -------
         ReverseMonteCarlo
             self. The weighted loss after each sweep is appended to
-            ``self.loss_history``.
+            ``self.loss_history``; with an energy, the energy per atom (eV) to
+            ``self.energy_history``, and the data weight is kept in
+            ``self.data_weight`` for the next run.
         """
         if (
             not isinstance(batch, (int, np.integer))
@@ -1706,6 +1886,12 @@ class ReverseMonteCarlo(AutoSerialize):
         loss = self._update_residual()
         if not self.loss_history:
             self.loss_history.append(loss)
+        hybrid = getattr(self, "energy_model", None) is not None
+        if hybrid:
+            if getattr(self, "data_ceiling", None) is None:
+                raise RuntimeError("set_data_sigma before a run with an energy")
+            if not getattr(self, "energy_history", None):
+                self.energy_history = [self.energy_model.total / n_sites]
         # Swap batches draw two distinct sites per proposed move. Keep batches
         # within that limit, and use a smaller final batch to include any
         # leftover proposal slots when the site count is not divisible.
@@ -1715,6 +1901,11 @@ class ReverseMonteCarlo(AutoSerialize):
         n_batches = (n_sites + batch - 1) // batch
         p_omega = omega_fraction if self.displacements else 0.0
         p_random = random_fraction if self.displacements else 0.0
+        if hybrid and getattr(self.energy_model, "swaps_only", False) and p_random + p_omega > 0:
+            raise ValueError(
+                "Relaxed swap energies score swaps only: run with random_fraction=0 and "
+                "omega_fraction=0."
+            )
         budget = (
             3 * max_static_b / (8 * np.pi**2) * n_sites if max_static_b is not None else np.inf
         )
@@ -1723,7 +1914,13 @@ class ReverseMonteCarlo(AutoSerialize):
         su = None
         for sweep in sweeps:
             accepted = {"swap": 0, "random": 0, "omega": 0}
+            energy_calls = 0
             for batch_index in range(n_batches):
+                if hybrid:
+                    if loss > self.data_ceiling:
+                        self.data_weight *= self._WEIGHT_RATE
+                    else:
+                        self.data_weight = max(self.data_weight / self._WEIGHT_RATE, 1.0)
                 current_batch = min(batch, n_sites - batch_index * batch)
                 if su is None:
                     su = self._scale * self._u
@@ -1781,24 +1978,31 @@ class ReverseMonteCarlo(AutoSerialize):
                 dL = (self._w * (dm**2 - 2 * self._r * dm)).sum(-1)
                 dl = dL.cpu().numpy()
                 nb = len(dl)
-                if not t0:
-                    t0 = float(np.median(np.abs(dl)))
-                temp = temperature * t0 * (1 - sweep / n_sweeps)
-                if temp > 0:
-                    acc = (dl < 0) | (self.rng.random(nb) < np.exp(-np.clip(dl / temp, 0, 50)))
+                if hybrid:
+                    moves, n_energy = self._hybrid_pick(
+                        kind, sites, new, dl, cap, max_static_b, budget
+                    )
+                    energy_calls += n_energy
+                    pick = np.asarray([m[0] for m in moves], dtype=int)
                 else:
-                    acc = dl < 0
-                pick = np.nonzero(acc)[0]
-                pick = pick[np.argsort(dl[pick])][:cap]
-                if kind != "swap" and max_static_b is not None:
-                    du2 = (self._u2(new) - self._u2(self.displacement[sites])).sum(1)
-                    total = self._u2(self.displacement).sum()
-                    chosen = []
-                    for b in pick:
-                        if du2[b] <= 0 or total + du2[b] <= budget:
-                            chosen.append(b)
-                            total += du2[b]
-                    pick = np.asarray(chosen, dtype=int)
+                    if not t0:
+                        t0 = float(np.median(np.abs(dl)))
+                    temp = temperature * t0 * (1 - sweep / n_sweeps)
+                    if temp > 0:
+                        acc = (dl < 0) | (self.rng.random(nb) < np.exp(-np.clip(dl / temp, 0, 50)))
+                    else:
+                        acc = dl < 0
+                    pick = np.nonzero(acc)[0]
+                    pick = pick[np.argsort(dl[pick])][:cap]
+                    if kind != "swap" and max_static_b is not None:
+                        du2 = (self._u2(new) - self._u2(self.displacement[sites])).sum(1)
+                        total = self._u2(self.displacement).sum()
+                        chosen = []
+                        for b in pick:
+                            if du2[b] <= 0 or total + du2[b] <= budget:
+                                chosen.append(b)
+                                total += du2[b]
+                        pick = np.asarray(chosen, dtype=int)
                 if len(pick) == 0:
                     continue
                 pk = torch.as_tensor(pick, device=self.device)
@@ -1812,7 +2016,12 @@ class ReverseMonteCarlo(AutoSerialize):
                     spec_new[a], spec_new[b] = spec[b], spec[a]
                 else:
                     disp_new[sites[pick]] = new[pick]
-                if loss_new > loss + max(temp, 0.0) * len(pick) and len(pick) > 1:
+                if hybrid:  # how much the moves' data changes interact, in w chi2/2 per move
+                    joint = self.data_weight * (loss_new - loss - dl[pick].sum())
+                    worse = joint / (2 * self.data_sigma2) > len(pick)
+                else:
+                    worse = loss_new > loss + max(temp, 0.0) * len(pick)
+                if worse and len(pick) > 1:
                     cap = max(cap // 2, 1)
                     continue
                 self._Fr, self._Fi, self._r = Fr_new, Fi_new, r_new
@@ -1821,17 +2030,97 @@ class ReverseMonteCarlo(AutoSerialize):
                 loss = loss_new
                 accepted[kind] += len(pick)
                 cap = min(int(cap * 1.25) + 1, batch)
+                if hybrid:
+                    for _, idx, numbers, positions, affected, new_e in moves:
+                        self.energy_model.apply(idx, numbers, positions, affected, new_e)
             if (sweep + 1) % refit_every == 0:
                 self._recompute_F()
                 self._solve_linear(self._model_diffuse())
                 loss = self._update_residual()
                 su = None
+                if hybrid:
+                    self.energy_model.rebuild()
             self.loss_history.append(loss)
-            sweeps.set_postfix(loss=f"{loss:.4g}", **accepted)
+            if hybrid:
+                self.energy_history.append(self.energy_model.total / n_sites)
+                sweeps.set_postfix(
+                    loss=f"{loss:.4g}",
+                    E=f"{self.energy_history[-1]:.4f}",
+                    weight=f"{self.data_weight:.3g}",
+                    energy_calls=energy_calls,
+                    **accepted,
+                )
+            else:
+                sweeps.set_postfix(loss=f"{loss:.4g}", **accepted)
         self._recompute_F()
         self._solve_linear(self._model_diffuse())
         self.loss_history[-1] = self._update_residual()
+        if hybrid:
+            self.energy_model.rebuild()
+            self.energy_history[-1] = self.energy_model.total / n_sites
         return self
+
+    def _hybrid_pick(self, kind, sites, new, dl, cap, max_static_b, budget):
+        """Moves of one batch to apply under ``exp(-w chi2/2 - E/kT)``, with their energy changes.
+
+        ``dl`` holds each proposal's exact change of the weighted loss, scored separately; w is
+        ``data_weight``, and kT is ``energy_kT`` for swaps and ``displacement_kT`` otherwise.
+        Moves with ``w |dchi2| / 2 > 3`` must first pass ``exp(-w dchi2/2)``. The rest, and
+        those that passed, are taken in random order; a move is skipped if any of its atoms (old
+        or new position) is closer than the energy model's separation to an atom of a move
+        already accepted, or if it would exceed the static B budget. At most ``cap`` moves get an
+        energy evaluation; each is accepted with ``exp(-dE/kT)`` after a data test, or
+        ``exp(-w dchi2/2 - dE/kT)`` otherwise.
+
+        Returns
+        -------
+        moves : list
+            ``(proposal index, sites, numbers, positions, affected, new_energies)`` of each
+            accepted move, the last four as :meth:`ClusterEnergy.apply` takes them.
+        n_energy : int
+            Energy evaluations made.
+        """
+        ce = self.energy_model
+        half = 0.5 * self.data_weight * dl / self.data_sigma2
+        large = np.abs(half) > 3.0
+        kT = self.energy_kT if kind == "swap" else self.displacement_kT
+        passed = ~large | (half <= 0)
+        passed |= self.rng.random(len(dl)) < np.exp(-np.clip(half, 0, 50))
+        step = ce.cell / self.grid_size  # A per fine-grid step
+        static = kind != "swap" and max_static_b is not None
+        total_u2 = self._u2(self.displacement).sum() if static else 0.0
+        taken = np.zeros((0, 3))
+        moves, n_energy = [], 0
+        for b in self.rng.permutation(np.nonzero(passed)[0]):
+            if n_energy == cap:
+                break
+            idx = sites[b]
+            centres = ce.positions[idx]
+            numbers = positions = None
+            if kind == "swap":
+                numbers = ce.numbers[idx[::-1]]
+            else:
+                positions = self._positions(idx, new[b]) * step
+                centres = np.vstack([centres, positions])
+            if len(taken):
+                d = centres[:, None, :] - taken[None]
+                d -= ce.cell * np.round(d / ce.cell)
+                if np.linalg.norm(d, axis=-1).min() < ce.separation:
+                    continue
+            du2 = 0.0
+            if static:
+                du2 = float((self._u2(new[b]) - self._u2(self.displacement[idx])).sum())
+                if du2 > 0 and total_u2 + du2 > budget:
+                    continue
+            dE, affected, new_e = ce.delta(idx, numbers=numbers, positions=positions)
+            n_energy += 1
+            exponent = dE / kT + (0.0 if large[b] else half[b])
+            if exponent > 0 and self.rng.random() >= np.exp(-min(exponent, 50.0)):
+                continue
+            moves.append((b, idx, numbers, positions, affected, new_e))
+            taken = np.vstack([taken, centres])
+            total_u2 += du2
+        return moves, n_energy
 
     def _random_proposals(self, batch: int):
         """Single atoms moved by -1, 0 or +1 grid steps along each axis (not all zero), within
